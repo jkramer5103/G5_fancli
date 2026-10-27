@@ -1,12 +1,12 @@
 # fancli
 
-Linux fan control for the Gigabyte G5 GE.
+Linux fan control using a hardware-specific embedded-controller IO sequence.
 
-This tool controls the laptop fans through the embedded controller IO ports. The EC command sequence was reverse engineered from the Windows fan-control software because there was no native Linux control path for this model.
+The repository and service names are historical. They do not establish compatibility with any particular manufacturer or model.
 
 ## Hardware
 
-- Tested target: Gigabyte G5 GE
+- Hardware compatibility must be verified for the actual machine; this repository does not identify a confirmed target.
 - NVIDIA GPU temperature is read through `nvidia-smi`
 - Fan control uses `outb`, provided by the `ioport` package on Debian/Ubuntu
 
@@ -37,7 +37,9 @@ sudo fancli max-stop
 
 ## Modes
 
-The different modes are built janky af and vibecoded, but they work. I might clean this up later, and I am very open to PRs.
+`status` and `watch` show the requested fan target, not a measured speed or RPM. CPU temperature is currently the hottest readable thermal zone, which may include sensors other than the CPU. A GPU sensor error shows the last known temperature (initially zero).
+
+MAX mode uses a separate background process. Its process lifecycle and transitions still need testing on the target hardware.
 
 ## Configuration
 
@@ -74,8 +76,10 @@ Restart the service after changing persistent config:
 sudo systemctl restart g5ge-fancontrol
 ```
 
+The daemon also rereads configuration each cycle. Modes must be `auto` or `manual`; manual speeds must be finite numbers from 0 to 100. Curves must contain at least one `[temperature, percentage]` pair, with finite numbers, strictly increasing temperatures, and percentages from 0 to 100. Invalid overrides fall back to persistent config; invalid persistent config falls back to the default curve.
+
 ## Development
 
 ```bash
-pytest -q
+python3 -m pytest -q
 ```

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""fancli — fan control CLI for Gigabyte G5 GE."""
+"""fancli — status and controls for the fan daemon."""
 
 import json
 import os
@@ -11,6 +11,8 @@ import time
 import argparse
 import glob as globmod
 
+from fancli_config import DEFAULT_CURVE, interpolate_curve, is_number, load_config as load_config_file
+
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 STATUS_PATH   = '/run/g5ge-fan/status.json'
@@ -18,7 +20,6 @@ OVERRIDE_PATH = '/run/g5ge-fan/override.json'
 CONFIG_PATH   = '/etc/g5ge-fan/config.json'
 RUN_DIR       = '/run/g5ge-fan'
 PID_FILE      = '/run/g5ge-fan/max.pid'
-DEFAULT_CURVE = [[0, 10], [50, 30], [65, 60], [75, 80], [85, 100]]
 STALE_THRESHOLD = 10  # seconds
 SERVICE_NAME  = 'g5ge-fancontrol'
 
@@ -58,6 +59,8 @@ def is_max_running():
     try:
         with open(PID_FILE) as f:
             pid = int(f.read().strip())
+        if pid <= 1:
+            return False
         os.kill(pid, 0)  # check if alive
         return True
     except (FileNotFoundError, ValueError, ProcessLookupError, OSError):
@@ -69,6 +72,8 @@ def stop_max():
     try:
         with open(PID_FILE) as f:
             pid = int(f.read().strip())
+        if pid <= 1:
+            return False
         os.kill(pid, signal.SIGTERM)
         os.remove(PID_FILE)
         return True
@@ -78,12 +83,12 @@ def stop_max():
 
 def _ensure_daemon_running():
     """Start the fan control daemon if not running."""
-    subprocess.run(['systemctl', 'start', SERVICE_NAME], check=False)
+    subprocess.run(['systemctl', 'start', SERVICE_NAME], check=True)
 
 
 def _ensure_daemon_stopped():
     """Stop the fan control daemon."""
-    subprocess.run(['systemctl', 'stop', SERVICE_NAME], check=False)
+    subprocess.run(['systemctl', 'stop', SERVICE_NAME], check=True)
 
 
 def _read_cpu_temp():
@@ -126,9 +131,19 @@ def read_status(path=None):
         path = STATUS_PATH
     try:
         with open(path) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, Exception):
+            data = json.load(f)
+    except (OSError, ValueError):
         return None
+    if not isinstance(data, dict) or data.get('mode') not in ('auto', 'manual', 'max'):
+        return None
+    for field in ('speed_pct', 'cpu_temp', 'gpu_temp', 'timestamp'):
+        if not is_number(data.get(field)):
+            return None
+    if not 0 <= data['speed_pct'] <= 100:
+        return None
+    if not isinstance(data.get('gpu_sensor_ok', True), bool):
+        return None
+    return data
 
 
 def write_status(mode, speed_pct, cpu_temp, gpu_temp):
@@ -160,18 +175,6 @@ def write_override(data):
     os.rename(tmp, OVERRIDE_PATH)
 
 
-def load_config_file(path):
-    """Load a config/override JSON file. Returns dict or None."""
-    try:
-        with open(path) as f:
-            data = json.load(f)
-        if 'mode' not in data:
-            return None
-        return data
-    except (FileNotFoundError, json.JSONDecodeError, Exception):
-        return None
-
-
 # ─── Status Display ───────────────────────────────────────────────────────────
 
 def render_status(status):
@@ -195,8 +198,8 @@ def render_status(status):
     gpu_suffix = f"  {RED}(sensor error){RESET}" if not gpu_ok else ""
     bar = format_bar(speed_pct)
 
-    # Fixed-width box — 36 chars wide interior
-    W = 36
+    # Leave room for the target percentage and the full 20-character bar.
+    W = 40
     def row(content):
         visible = re.sub(r'\033\[[^m]*m', '', content)
         pad = W - len(visible)
@@ -204,12 +207,12 @@ def render_status(status):
 
     lines = [
         "╔" + "═" * W + "╗",
-        row("       G5 GE Fan Control         "),
+        row('Fan Control'.center(W)),
         "╠" + "═" * W + "╣",
         row(f"  Mode:      {mode_display}"),
         row(f"  CPU Temp:  {cpu_color}{cpu_temp}°C{RESET}"),
         row(f"  GPU Temp:  {gpu_color}{gpu_temp}°C{RESET}{gpu_suffix}"),
-        row(f"  Fan Speed: {speed_pct}%  {bar}"),
+        row(f"  Fan Target: {speed_pct}%  {bar}"),
         "╚" + "═" * W + "╝",
     ]
     return lines
@@ -222,12 +225,12 @@ def cmd_status(args):
         if is_max_running():
             print(f"{RED}{BOLD}MAX{RESET} mode active (no status data yet)")
         else:
-            print("Daemon not running (no status file found).")
+            print("No valid status data. The daemon may not be running.")
         sys.exit(1)
     lines = render_status(status)
     print('\n'.join(lines))
-    if status['mode'] != 'max' and is_stale(status.get('timestamp', 0)):
-        print(f"{RED}[DAEMON NOT RUNNING — stale data]{RESET}")
+    if is_stale(status['timestamp']):
+        print(f"{RED}[STALE DATA — fan controller may not be running]{RESET}")
 
 
 # ─── set / auto ───────────────────────────────────────────────────────────────
@@ -268,7 +271,7 @@ def cmd_auto(args):
 # ─── curve ────────────────────────────────────────────────────────────────────
 
 def get_active_curve_info():
-    """Return (curve, manual_speed_or_None, note_str) per spec 4-step logic."""
+    """Return the active curve, optional manual target, and an explanatory note."""
     override = load_config_file(OVERRIDE_PATH)
     if override is not None:
         if override.get('mode') == 'auto':
@@ -290,7 +293,7 @@ def get_active_curve_info():
             spd = cfg['speed']
             return cfg.get('curve', DEFAULT_CURVE), spd, f"[Manual at {spd}% — background curve from config]"
 
-    return DEFAULT_CURVE, None, '(using default curve — config.json missing or unreadable)'
+    return DEFAULT_CURVE, None, '(using default curve — config.json missing, unreadable or invalid)'
 
 
 def render_curve_chart(curve, manual_speed=None, width=60, height=20):
@@ -299,18 +302,6 @@ def render_curve_chart(curve, manual_speed=None, width=60, height=20):
     temp_max   = curve[-1][0]
     temp_range = temp_max - temp_min or 1
 
-    def interp(t):
-        if t <= curve[0][0]:
-            return curve[0][1]
-        if t >= curve[-1][0]:
-            return curve[-1][1]
-        for i in range(len(curve) - 1):
-            t0, s0 = curve[i]
-            t1, s1 = curve[i + 1]
-            if t0 <= t <= t1:
-                return s0 + (t - t0) / (t1 - t0) * (s1 - s0)
-        return curve[-1][1]
-
     def speed_to_y(s):
         return height - 1 - round(s / 100 * (height - 1))
 
@@ -318,7 +309,7 @@ def render_curve_chart(curve, manual_speed=None, width=60, height=20):
 
     for i in range(width):
         t = temp_min + i / max(width - 1, 1) * temp_range
-        s = interp(t)
+        s = interpolate_curve(curve, t)
         y = speed_to_y(s)
         if 0 <= y < height:
             grid[y][i] = f"{CYAN}*{RESET}"
@@ -339,8 +330,8 @@ def render_curve_chart(curve, manual_speed=None, width=60, height=20):
     n_labels = 6
     label_line = "      "
     for i in range(n_labels):
-        t = temp_min + i * temp_range // max(n_labels - 1, 1)
-        label_line += f"{t:<10}"
+        t = temp_min + i * temp_range / max(n_labels - 1, 1)
+        label_line += f"{t:<10g}"
     lines.append(label_line)
     lines.append(f"      Temperature °C  ({temp_min}–{temp_max}°C)")
     return lines
@@ -372,20 +363,17 @@ def cmd_watch(args):
                 if is_max_running():
                     print(f"{RED}{BOLD}MAX{RESET} mode active (no status data yet)")
                 else:
-                    print("Daemon not running (no status file found).")
+                    print("No valid status data. The daemon may not be running.")
             else:
                 print('\n'.join(render_status(status)))
-                if status['mode'] != 'max' and is_stale(status.get('timestamp', 0)):
-                    print(f"{RED}[DAEMON NOT RUNNING — stale data]{RESET}")
+                if is_stale(status['timestamp']):
+                    print(f"{RED}[STALE DATA — fan controller may not be running]{RESET}")
             time.sleep(2)
     except KeyboardInterrupt:
-        sys.stdout.write('\033[?25h')
-        sys.stdout.flush()
         print("Stopped.")
-    except Exception:
+    finally:
         sys.stdout.write('\033[?25h')
         sys.stdout.flush()
-        raise
 
 
 # ─── max ──────────────────────────────────────────────────────────────────────
@@ -470,7 +458,7 @@ def cmd_max_stop(args):
 # ─── main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(prog='fancli', description='G5 GE fan control')
+    parser = argparse.ArgumentParser(prog='fancli', description='Fan control CLI')
     sub = parser.add_subparsers(dest='command')
 
     sub.add_parser('status',   help='Show fan status dashboard')
@@ -495,7 +483,11 @@ if __name__ == '__main__':
     }
     fn = dispatch.get(args.command)
     if fn:
-        fn(args)
+        try:
+            fn(args)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
     else:
         parser.print_help()
         sys.exit(1)

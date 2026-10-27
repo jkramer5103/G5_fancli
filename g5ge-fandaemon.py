@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""G5 GE Fan Control Daemon — controls fans via EC IO ports."""
+"""Fan control daemon using a hardware-specific EC IO sequence."""
 
 import json
 import logging
@@ -10,42 +10,12 @@ import sys
 import time
 import glob
 
-DEFAULT_CURVE = [[0, 10], [50, 30], [65, 60], [75, 80], [85, 100]]
+from fancli_config import DEFAULT_CURVE, interpolate_curve, load_config
+
 CONFIG_PATH = '/etc/g5ge-fan/config.json'
 OVERRIDE_PATH = '/run/g5ge-fan/override.json'
 STATUS_PATH = '/run/g5ge-fan/status.json'
 CYCLE_SECONDS = 2
-
-
-def interpolate_curve(curve, temp):
-    """Linear interpolation of fan speed % from curve at given temp."""
-    if temp <= curve[0][0]:
-        return curve[0][1]
-    if temp >= curve[-1][0]:
-        return curve[-1][1]
-    for i in range(len(curve) - 1):
-        t0, s0 = curve[i]
-        t1, s1 = curve[i + 1]
-        if t0 <= temp <= t1:
-            frac = (temp - t0) / (t1 - t0)
-            return s0 + frac * (s1 - s0)
-    return curve[-1][1]
-
-
-def load_config(path):
-    """Load and parse config/override JSON. Returns dict or None on error."""
-    try:
-        with open(path) as f:
-            data = json.load(f)
-        if 'mode' not in data:
-            return None
-        if data['mode'] == 'auto':
-            data.setdefault('curve', DEFAULT_CURVE)
-        return data
-    except FileNotFoundError:
-        return None
-    except (json.JSONDecodeError, Exception):
-        return None
 
 
 def pct_to_raw(percent):
@@ -80,7 +50,7 @@ def read_gpu_temp():
         if result.returncode != 0:
             return None
         return int(result.stdout.strip())
-    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError, Exception):
+    except (OSError, subprocess.TimeoutExpired, ValueError):
         return None
 
 

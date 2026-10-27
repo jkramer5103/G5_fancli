@@ -1,5 +1,5 @@
 [Unit]
-Description=G5 GE Fan Control Daemon
+Description=Fan Control Daemon
 
 [Service]
 Type=simple

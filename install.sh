@@ -6,12 +6,15 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-if ! which outb > /dev/null 2>&1; then
+if ! command -v outb > /dev/null 2>&1; then
     echo "Error: 'outb' binary not found. Install with: sudo apt install ioport"
     exit 1
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Check the Python sources before stopping a working installation.
+python3 -m py_compile "$SCRIPT_DIR/fancli_config.py" "$SCRIPT_DIR/g5ge-fandaemon.py" "$SCRIPT_DIR/fancli"
 
 if systemctl is-active --quiet g5ge-fancontrol 2>/dev/null; then
     echo "Stopping existing g5ge-fancontrol service..."
@@ -19,6 +22,7 @@ if systemctl is-active --quiet g5ge-fancontrol 2>/dev/null; then
 fi
 
 echo "Installing daemon..."
+install -m 644 "$SCRIPT_DIR/fancli_config.py" /usr/local/bin/fancli_config.py
 cp "$SCRIPT_DIR/g5ge-fandaemon.py" /usr/local/bin/g5ge-fandaemon.py
 chmod 755 /usr/local/bin/g5ge-fandaemon.py
 

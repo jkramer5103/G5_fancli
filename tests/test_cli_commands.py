@@ -14,9 +14,14 @@ def reload():
     _spec.loader.exec_module(cli)
 
 
-class TestCmdSet:
-    def setup_method(self): reload()
+@pytest.fixture(autouse=True)
+def isolate_max_process(tmp_path, monkeypatch):
+    # Existing command tests must never read or signal a real MAX process.
+    reload()
+    monkeypatch.setattr(cli, 'PID_FILE', str(tmp_path / 'max.pid'))
 
+
+class TestCmdSet:
     def test_writes_override_json(self, tmp_path):
         override_path = str(tmp_path / "override.json")
         with patch.object(cli, 'OVERRIDE_PATH', override_path), \
@@ -47,8 +52,6 @@ class TestCmdSet:
 
 
 class TestCmdAuto:
-    def setup_method(self): reload()
-
     def test_removes_override_file(self, tmp_path):
         override_path = str(tmp_path / "override.json")
         with open(override_path, 'w') as f:
@@ -76,8 +79,6 @@ class TestCmdAuto:
 
 
 class TestGetActiveCurveInfo:
-    def setup_method(self): reload()
-
     def test_auto_override_uses_override_curve(self, tmp_path):
         override = tmp_path / "override.json"
         override.write_text('{"mode": "auto", "curve": [[0,5],[100,90]]}')
