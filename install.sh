@@ -6,8 +6,8 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-if ! command -v outb > /dev/null 2>&1; then
-    echo "Error: 'outb' binary not found. Install with: sudo apt install ioport"
+if [ ! -e /dev/port ]; then
+    echo "Error: /dev/port is missing; the daemon writes the EC through it."
     exit 1
 fi
 
@@ -43,7 +43,8 @@ else
 fi
 
 systemctl daemon-reload
-systemctl enable --now g5ge-fancontrol
+systemctl enable g5ge-fancontrol
+systemctl restart g5ge-fancontrol
 
 echo ""
 echo "Installed. Fan control is active. Run 'fancli status' to check."

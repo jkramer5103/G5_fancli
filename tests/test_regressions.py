@@ -21,10 +21,19 @@ def isolated_runtime(tmp_path, monkeypatch):
                                ('CONFIG_PATH', 'config.json')]:
             monkeypatch.setattr(module, name, str(tmp_path / filename))
     monkeypatch.setattr(cli, 'RUN_DIR', str(tmp_path))
-    monkeypatch.setattr(cli, 'PID_FILE', str(tmp_path / 'max.pid'))
-    # A missed mock must fail the test rather than run a command or signal.
+    # A missed mock must fail the test rather than run a command.
     monkeypatch.setattr(subprocess, 'run', Mock(side_effect=AssertionError('unmocked command')))
-    monkeypatch.setattr(cli.os, 'kill', Mock(side_effect=AssertionError('unmocked signal')))
+
+
+def write_status(mode, speed_pct, cpu_temp, gpu_temp, timestamp=None):
+    daemon.write_status(cli.STATUS_PATH, mode, speed_pct, cpu_temp,
+                        gpu_temp if gpu_temp is not None else 0, gpu_temp is not None)
+    if timestamp is not None:
+        with open(cli.STATUS_PATH) as f:
+            data = json.load(f)
+        data['timestamp'] = timestamp
+        with open(cli.STATUS_PATH, 'w') as f:
+            json.dump(data, f)
 
 
 @pytest.mark.parametrize('data', [
@@ -66,12 +75,7 @@ def test_invalid_persistent_config_uses_default():
 
 @pytest.mark.parametrize('mode', ['auto', 'manual', 'max'])
 def test_stale_status_is_reported_in_every_mode(mode, capsys):
-    cli.write_status(mode, 100, 80, 75)
-    with open(cli.STATUS_PATH) as f:
-        data = json.load(f)
-    data['timestamp'] = 0
-    with open(cli.STATUS_PATH, 'w') as f:
-        json.dump(data, f)
+    write_status(mode, 100, 80, 75, timestamp=0)
     cli.cmd_status(None)
     assert 'STALE DATA' in capsys.readouterr().out
 
@@ -86,39 +90,46 @@ def test_invalid_status_is_unavailable(data):
 
 @pytest.mark.parametrize('speed', [0, 99, 100])
 def test_status_box_fits_full_bar(speed):
-    cli.write_status('auto', speed, 100, None)
+    write_status('auto', speed, 100, None)
     lines = [strip_ansi(line) for line in cli.render_status(cli.read_status())]
     assert len({len(line) for line in lines}) == 1
     assert 'Fan Target:' in '\n'.join(lines)
 
 
-@pytest.mark.parametrize('pid', [-100, -1, 0, 1])
-def test_invalid_pid_never_signals_processes(pid):
-    with open(cli.PID_FILE, 'w') as f:
-        f.write(str(pid))
-    assert cli.is_max_running() is False
-    assert cli.stop_max() is False
-    cli.os.kill.assert_not_called()
+def test_max_is_a_full_speed_override():
+    cli.cmd_max(None)
+    assert load_config(cli.OVERRIDE_PATH)['speed'] == 100
+    cli.cmd_max_stop(None)
+    assert load_config(cli.OVERRIDE_PATH) is None
 
 
-def test_failed_service_stop_prevents_max_start(monkeypatch):
-    monkeypatch.setattr(cli.os, 'geteuid', lambda: 0)
-    fork = Mock(side_effect=AssertionError('must not fork'))
-    monkeypatch.setattr(cli.os, 'fork', fork)
-    failure = subprocess.CalledProcessError(1, ['systemctl'])
-    monkeypatch.setattr(subprocess, 'run', Mock(side_effect=failure))
-    with pytest.raises(subprocess.CalledProcessError):
-        cli.cmd_max(None)
-    fork.assert_not_called()
+class FakeEc:
+    def __init__(self):
+        self.commands = []
+
+    def command(self, cmd, *data):
+        self.commands.append((cmd, *data))
+
+    def read(self, address):
+        return {0xD0: 0x01, 0xD1: 0xD1, 0xD2: 0x00, 0xD3: 0x00}[address]
 
 
-def test_failed_service_start_does_not_report_success(monkeypatch, capsys):
-    monkeypatch.setattr(cli.os, 'geteuid', lambda: 0)
-    failure = subprocess.CalledProcessError(1, ['systemctl'])
-    monkeypatch.setattr(subprocess, 'run', Mock(side_effect=failure))
-    with pytest.raises(subprocess.CalledProcessError):
-        cli.cmd_max_stop(None)
-    assert 'Daemon restarted' not in capsys.readouterr().out
+def test_both_fans_get_the_duty():
+    ec = FakeEc()
+    daemon.send_fan_speeds(ec, 0xAB)
+    assert ec.commands == [(0x99, 1, 0xAB), (0x99, 2, 0xAB)]
+
+
+def test_tach_converts_to_rpm():
+    assert daemon.read_fan_rpms(FakeEc()) == [2156220 // 0x01D1, 0]
+
+
+def test_ec_handshake_times_out_instead_of_hanging(monkeypatch):
+    ec = daemon.EmbeddedController.__new__(daemon.EmbeddedController)
+    monkeypatch.setattr(ec, '_status', lambda: daemon.EC_IBF)  # never drains
+    monkeypatch.setattr(daemon, 'EC_TIMEOUT', 0.01)
+    with pytest.raises(daemon.EcError):
+        ec.command(0x99, 1, 0xFF)
 
 
 def test_watch_restores_cursor_on_system_exit(monkeypatch, capsys):

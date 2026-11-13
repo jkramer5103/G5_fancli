@@ -4,12 +4,10 @@
 import json
 import os
 import re
-import signal
 import subprocess
 import sys
 import time
 import argparse
-import glob as globmod
 
 from fancli_config import DEFAULT_CURVE, interpolate_curve, is_number, load_config as load_config_file
 
@@ -19,9 +17,7 @@ STATUS_PATH   = '/run/g5ge-fan/status.json'
 OVERRIDE_PATH = '/run/g5ge-fan/override.json'
 CONFIG_PATH   = '/etc/g5ge-fan/config.json'
 RUN_DIR       = '/run/g5ge-fan'
-PID_FILE      = '/run/g5ge-fan/max.pid'
 STALE_THRESHOLD = 10  # seconds
-SERVICE_NAME  = 'g5ge-fancontrol'
 
 # ─── ANSI ─────────────────────────────────────────────────────────────────────
 
@@ -52,72 +48,6 @@ def format_bar(pct, width=20):
     return f"{CYAN}{bar}{RESET}"
 
 
-# ─── Max mode helpers ────────────────────────────────────────────────────────
-
-def is_max_running():
-    """Check if a max fan process is running."""
-    try:
-        with open(PID_FILE) as f:
-            pid = int(f.read().strip())
-        if pid <= 1:
-            return False
-        os.kill(pid, 0)  # check if alive
-        return True
-    except (FileNotFoundError, ValueError, ProcessLookupError, OSError):
-        return False
-
-
-def stop_max():
-    """Stop a running background max process if any. Returns True if stopped."""
-    try:
-        with open(PID_FILE) as f:
-            pid = int(f.read().strip())
-        if pid <= 1:
-            return False
-        os.kill(pid, signal.SIGTERM)
-        os.remove(PID_FILE)
-        return True
-    except (FileNotFoundError, ValueError, ProcessLookupError, OSError):
-        return False
-
-
-def _ensure_daemon_running():
-    """Start the fan control daemon if not running."""
-    subprocess.run(['systemctl', 'start', SERVICE_NAME], check=True)
-
-
-def _ensure_daemon_stopped():
-    """Stop the fan control daemon."""
-    subprocess.run(['systemctl', 'stop', SERVICE_NAME], check=True)
-
-
-def _read_cpu_temp():
-    """Return max CPU temp in °C, or None."""
-    paths = globmod.glob('/sys/class/thermal/thermal_zone*/temp')
-    temps = []
-    for p in paths:
-        try:
-            with open(p) as f:
-                temps.append(int(f.read().strip()) / 1000.0)
-        except (OSError, ValueError):
-            continue
-    return round(max(temps)) if temps else None
-
-
-def _read_gpu_temp():
-    """Return GPU temp as int, or None."""
-    try:
-        result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=temperature.gpu', '--format=csv,noheader'],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0:
-            return int(result.stdout.strip())
-    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
-        pass
-    return None
-
-
 # ─── IPC Helpers ──────────────────────────────────────────────────────────────
 
 def is_stale(timestamp):
@@ -144,26 +74,6 @@ def read_status(path=None):
     if not isinstance(data.get('gpu_sensor_ok', True), bool):
         return None
     return data
-
-
-def write_status(mode, speed_pct, cpu_temp, gpu_temp):
-    """Write status.json."""
-    os.makedirs(RUN_DIR, mode=0o755, exist_ok=True)
-    data = {
-        'mode': mode,
-        'speed_pct': round(speed_pct),
-        'cpu_temp': cpu_temp if cpu_temp is not None else 0,
-        'gpu_temp': gpu_temp if gpu_temp is not None else 0,
-        'gpu_sensor_ok': gpu_temp is not None,
-        'timestamp': time.time(),
-    }
-    tmp = STATUS_PATH + '.tmp'
-    with open(tmp, 'w') as f:
-        json.dump(data, f)
-        f.flush()
-        os.fsync(f.fileno())
-    os.rename(tmp, STATUS_PATH)
-    os.chmod(STATUS_PATH, 0o644)
 
 
 def write_override(data):
@@ -222,10 +132,7 @@ def cmd_status(args):
     """Print fan status dashboard."""
     status = read_status()
     if status is None:
-        if is_max_running():
-            print(f"{RED}{BOLD}MAX{RESET} mode active (no status data yet)")
-        else:
-            print("No valid status data. The daemon may not be running.")
+        print("No valid status data. The daemon may not be running.")
         sys.exit(1)
     lines = render_status(status)
     print('\n'.join(lines))
@@ -241,26 +148,18 @@ def cmd_set(args):
     if not (0 <= pct <= 100):
         print(f"Error: percent must be 0-100, got {pct}", file=sys.stderr)
         sys.exit(1)
-    # Stop max mode if active
-    if stop_max():
-        print("Stopped max mode.")
-        _ensure_daemon_running()
     write_override({'mode': 'manual', 'speed': pct})
     print(f"Override set: manual at {pct}%")
 
 
 def cmd_auto(args):
     """Clear manual override."""
-    # Stop max mode if active
-    if stop_max():
-        print("Stopped max mode.")
-        _ensure_daemon_running()
     try:
         os.remove(OVERRIDE_PATH)
     except FileNotFoundError:
         pass
     except PermissionError:
-        print("Error: permission denied. Run as root.", file=sys.stderr)
+        print("Error: permission denied. Run as root or a member of wheel.", file=sys.stderr)
         sys.exit(1)
     except OSError as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -339,9 +238,6 @@ def render_curve_chart(curve, manual_speed=None, width=60, height=20):
 
 def cmd_curve(args):
     """Display ASCII fan curve chart."""
-    if is_max_running():
-        print(f"{RED}{BOLD}MAX mode active{RESET} — fan curve not in use")
-        print()
     curve, manual_speed, note = get_active_curve_info()
     if note:
         print(note)
@@ -360,10 +256,7 @@ def cmd_watch(args):
             sys.stdout.write('\033[2J\033[H')
             sys.stdout.flush()
             if status is None:
-                if is_max_running():
-                    print(f"{RED}{BOLD}MAX{RESET} mode active (no status data yet)")
-                else:
-                    print("No valid status data. The daemon may not be running.")
+                print("No valid status data. The daemon may not be running.")
             else:
                 print('\n'.join(render_status(status)))
                 if is_stale(status['timestamp']):
@@ -378,81 +271,15 @@ def cmd_watch(args):
 
 # ─── max ──────────────────────────────────────────────────────────────────────
 
-def _fan_max_loop():
-    """Background loop: send max fan speed every 2 seconds, write status."""
-    os.makedirs(RUN_DIR, mode=0o755, exist_ok=True)
-    with open(PID_FILE, 'w') as f:
-        f.write(str(os.getpid()))
-
-    def handle_sigterm(signum, frame):
-        try:
-            os.remove(PID_FILE)
-        except OSError:
-            pass
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, handle_sigterm)
-
-    try:
-        while True:
-            subprocess.run(['outb', '0x66', '0x99'], check=True)
-            subprocess.run(['outb', '0x62', '0x01'], check=True)
-            subprocess.run(['outb', '0x62', '0xFF'], check=True)
-
-            # Write status so fancli status/watch can show MAX mode
-            cpu_temp = _read_cpu_temp()
-            gpu_temp = _read_gpu_temp()
-            write_status('max', 100, cpu_temp, gpu_temp)
-
-            time.sleep(2)
-    finally:
-        try:
-            os.remove(PID_FILE)
-        except OSError:
-            pass
-
-
 def cmd_max(args):
-    """Run fans at maximum speed in the background."""
-    if os.geteuid() != 0:
-        print("Error: 'fancli max' must run as root (use sudo).", file=sys.stderr)
-        sys.exit(1)
-
-    # Stop any existing max process and the daemon
-    stop_max()
-    _ensure_daemon_stopped()
-
-    pid = os.fork()
-    if pid > 0:
-        # Parent
-        print(f"Fan max started (pid {pid}). Use 'sudo fancli max-stop' to stop.")
-        return
-
-    # Child: detach and run
-    os.setsid()
-    sys.stdin.close()
-    devnull = open(os.devnull, 'w')
-    sys.stdout = devnull
-    sys.stderr = devnull
-    try:
-        _fan_max_loop()
-    except Exception:
-        pass
-    finally:
-        sys.exit(0)
+    """Run fans at full speed (a 100% manual override)."""
+    write_override({'mode': 'manual', 'speed': 100})
+    print("Fan max: manual override at 100%. Use 'fancli auto' to return to the curve.")
 
 
 def cmd_max_stop(args):
-    """Stop background max fan process and restart daemon."""
-    if os.geteuid() != 0:
-        print("Error: must run as root (use sudo).", file=sys.stderr)
-        sys.exit(1)
-    if stop_max():
-        print("Fan max stopped.")
-    else:
-        print("No fan max process running.")
-    _ensure_daemon_running()
-    print("Daemon restarted.")
+    """Alias for auto, kept for compatibility."""
+    cmd_auto(args)
 
 
 # ─── main ─────────────────────────────────────────────────────────────────────
@@ -467,8 +294,8 @@ if __name__ == '__main__':
     sub.add_parser('auto',     help='Clear manual override')
     sub.add_parser('curve',    help='Show fan curve ASCII chart')
     sub.add_parser('watch',    help='Live-updating status (Ctrl+C to exit)')
-    sub.add_parser('max',      help='Run fans at max speed (requires sudo)')
-    sub.add_parser('max-stop', help='Stop max mode, restart daemon (requires sudo)')
+    sub.add_parser('max',      help='Run fans at max speed')
+    sub.add_parser('max-stop', help='Same as auto')
 
     args = parser.parse_args()
 

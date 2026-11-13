@@ -15,10 +15,8 @@ def reload():
 
 
 @pytest.fixture(autouse=True)
-def isolate_max_process(tmp_path, monkeypatch):
-    # Existing command tests must never read or signal a real MAX process.
+def fresh_module():
     reload()
-    monkeypatch.setattr(cli, 'PID_FILE', str(tmp_path / 'max.pid'))
 
 
 class TestCmdSet:
